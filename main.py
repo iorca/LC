@@ -6,6 +6,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -23,9 +24,17 @@ seventh_day_url = "https://m.jlc.com/api/activity/sign/receiveVoucher"
 # token 匿名指纹做 key: 记忆文件只存 sha256 前 12 位, 不落明文 token;
 # 已签到(ok/already)的账号当天再跑直接跳过, 零请求; 失败不记, 下个 6 小时周期自然重试;
 # 记忆保留 30 天滚动清理。GHA 侧由 actions/cache 持久化本文件 (兼作仓库保活)。
+# 日期 key 钉死东八区: GHA runner 是 UTC, 北京 00 点的 cron 在 UTC 是前一天 16 点,
+# 用系统时区会取到前一天日期 -> 撞上前一天记忆 -> 新一天签到被跳过。
+
+TZ_CN = timezone(timedelta(hours=8))
 
 STATE_FILE = Path(__file__).resolve().parent / '.checkin_state.json'
 STATE_KEEP_DAYS = 30
+
+
+def today_str():
+    return datetime.now(TZ_CN).strftime('%Y-%m-%d')
 
 
 def token_key(token):
@@ -44,7 +53,7 @@ def load_state():
 
 def save_state(state):
     # 30 天滚动清理
-    keep_after = time.strftime("%Y-%m-%d", time.localtime(time.time() - STATE_KEEP_DAYS * 86400))
+    keep_after = (datetime.now(TZ_CN) - timedelta(days=STATE_KEEP_DAYS)).strftime("%Y-%m-%d")
     state["days"] = {d: v for d, v in state.get("days", {}).items() if d >= keep_after}
     try:
         STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2),
@@ -219,7 +228,7 @@ def main():
 
     # 当日签到记忆
     state = load_state()
-    today = time.strftime("%Y-%m-%d")
+    today = today_str()
     state_changed = False
 
     # 顺序执行签到任务
