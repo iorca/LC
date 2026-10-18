@@ -2,16 +2,32 @@ name: JLC Auto Sign
 
 on:
   schedule:
-    - cron: '0 16,22,4,10 * * *'  # 每 6 小时执行一次，UTC 时间
+    # 一天 4 次 (UTC 16/22/04/10 = 北京 00/06/12/18): 保留冗余,
+    # 当日记忆命中后第 2/3/4 次零请求跳过, 实际每账号每天最多 1 次签到
+    - cron: '0 16,22,4,10 * * *'
 
   workflow_dispatch:
+
+# cache 读写 (签到记忆持久化 + 仓库保活: 每天有 cache 活动, 避免 60 天无活动被禁用定时任务)
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   sign:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
+
+    # 恢复签到记忆 (.checkin_state.json): 同日已签到的账号直接跳过, 零请求
+    - name: 恢复签到记忆
+      uses: actions/cache/restore@v4
+      with:
+        path: .checkin_state.json
+        key: checkin-state-${{ github.run_number }}
+        restore-keys: |
+          checkin-state-
 
     - name: Run Sign Script
       env:
@@ -19,3 +35,11 @@ jobs:
         SEND_KEY_LIST: ${{ secrets.SEND_KEY_LIST }}
       run: |
         python main.py
+
+    # 保存签到记忆 (always: 失败也存, 保住当日已成功的记录); 文件极小, 单 cache 即可
+    - name: 保存签到记忆
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: .checkin_state.json
+        key: checkin-state-${{ github.run_number }}

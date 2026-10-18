@@ -1,12 +1,15 @@
 # -*- coding: UTF-8 -*-
 
-import requests
+import hashlib
 import json
-import time
-import random
 import os
-from requests.exceptions import RequestException
+import random
+import time
 from collections import defaultdict
+from pathlib import Path
+
+import requests
+from requests.exceptions import RequestException
 
 TOKEN_LIST = os.getenv('TOKEN_LIST', '')
 SEND_KEY_LIST = os.getenv('SEND_KEY_LIST', '')
@@ -15,6 +18,43 @@ SEND_KEY_LIST = os.getenv('SEND_KEY_LIST', '')
 url = 'https://m.jlc.com/api/activity/sign/signIn?source=3'
 gold_bean_url = "https://m.jlc.com/api/appPlatform/center/assets/selectPersonalAssetsInfo"
 seventh_day_url = "https://m.jlc.com/api/activity/sign/receiveVoucher"
+
+# ======== 当日签到记忆 (防风控) ========
+# token 匿名指纹做 key: 记忆文件只存 sha256 前 12 位, 不落明文 token;
+# 已签到(ok/already)的账号当天再跑直接跳过, 零请求; 失败不记, 下个 6 小时周期自然重试;
+# 记忆保留 30 天滚动清理。GHA 侧由 actions/cache 持久化本文件 (兼作仓库保活)。
+
+STATE_FILE = Path(__file__).resolve().parent / '.checkin_state.json'
+STATE_KEEP_DAYS = 30
+
+
+def token_key(token):
+    """token 的匿名指纹 (跨 run 稳定, 不暴露明文)"""
+    return hashlib.sha256(token.strip().encode('utf-8')).hexdigest()[:12]
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {"days": {}}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return {"days": {}}
+
+
+def save_state(state):
+    # 30 天滚动清理
+    keep_after = time.strftime("%Y-%m-%d", time.localtime(time.time() - STATE_KEEP_DAYS * 86400))
+    state["days"] = {d: v for d, v in state.get("days", {}).items() if d >= keep_after}
+    try:
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                              encoding='utf-8')
+    except Exception as e:
+        print(f"⚠️ 状态写入失败: {e}")
+
+
+def mark_done(state, today, key, status):
+    state["days"].setdefault(today, {})[key] = status
 
 
 # ======== 工具函数 ========
@@ -63,6 +103,9 @@ def send_msg_by_server(send_key, title, content):
 
 
 # ======== 单个账号签到逻辑 ========
+# 返回 (status, message):
+#   status: ok=今日签到成功 / already=今日已签到 / fail=失败(未记记忆, 下周期重试)
+#   message: 仅 ok 时非空 (推送到 Server 酱的内容)
 
 def sign_in(access_token, retries=3, backoff=10):
     headers = {
@@ -92,10 +135,10 @@ def sign_in(access_token, retries=3, backoff=10):
                 message = sign_result.get('message', '未知错误')
                 if '已经签到' in message:
                     print(f"ℹ️ [账号{mask_account(customer_code)}] 今日已签到")
-                    return None  # 今日已签到，不返回消息
+                    return ("already", None)
                 else:
                     print(f"❌ [账号{mask_account(customer_code)}] 签到失败 - {message}")
-                    return None  # 签到失败，不返回消息
+                    return ("fail", None)
 
             # 解析签到数据
             data = sign_result.get('data', {})
@@ -108,7 +151,8 @@ def sign_in(access_token, retries=3, backoff=10):
             if status and status > 0:
                 if gain_num is not None and gain_num != 0:
                     print(f"✅ [账号{mask_account(customer_code)}] 今日签到成功")
-                    return f"✅ 账号({mask_account(customer_code)})：获取{gain_num}个金豆，当前总数：{integral_voucher + gain_num}"
+                    return ("ok",
+                            f"✅ 账号({mask_account(customer_code)})：获取{gain_num}个金豆，当前总数：{integral_voucher + gain_num}")
                 else:
                     # 第七天特殊处理
                     seventh_response = requests.get(seventh_day_url, headers=headers, timeout=15)
@@ -117,13 +161,14 @@ def sign_in(access_token, retries=3, backoff=10):
 
                     if seventh_result.get("success"):
                         print(f"🎉 [账号{mask_account(customer_code)}] 第七天签到成功")
-                        return f"🎉 账号({mask_account(customer_code)})：第七天签到成功，当前金豆总数：{integral_voucher + 8}"
+                        return ("ok",
+                                f"🎉 账号({mask_account(customer_code)})：第七天签到成功，当前金豆总数：{integral_voucher + 8}")
                     else:
                         print(f"ℹ️ [账号{mask_account(customer_code)}] 第七天签到失败，无金豆获取")
-                        return None
+                        return ("already", None)
             else:
                 print(f"ℹ️ [账号{mask_account(customer_code)}] 今日已签到或签到失败")
-                return None
+                return ("already", None)
 
         except RequestException as e:
             print(f"⚠️ [账号{mask_account(access_token)}] 第{attempt}次请求失败: {str(e)}")
@@ -133,13 +178,13 @@ def sign_in(access_token, retries=3, backoff=10):
                 time.sleep(wait)
             else:
                 print(f"❌ [账号{mask_account(access_token)}] 已重试 {retries} 次，放弃")
-                return None
+                return ("fail", None)
         except KeyError as e:
             print(f"❌ [账号{mask_account(access_token)}] 数据解析失败: 缺少键 {str(e)}")
-            return None
+            return ("fail", None)
         except Exception as e:
             print(f"❌ [账号{mask_account(access_token)}] 未知错误: {str(e)}")
-            return None
+            return ("fail", None)
 
 
 # ======== 主函数 ========
@@ -172,6 +217,11 @@ def main():
 
     print(f"📊 共分为 {len(task_groups)} 个通知组")
 
+    # 当日签到记忆
+    state = load_state()
+    today = time.strftime("%Y-%m-%d")
+    state_changed = False
+
     # 顺序执行签到任务
     group_results = {}
 
@@ -182,10 +232,23 @@ def main():
         for i, token in enumerate(tokens):
             print(f"📝 处理第 {i+1}/{len(tokens)} 个账号...")
 
+            key = token_key(token)
+
+            # 当日已签到 -> 直接跳过, 零请求 (防风控)
+            done = state["days"].get(today, {}).get(key)
+            if done:
+                print(f"⏭️ [账号{mask_account(token)}] 今日已处理 (记忆: {done}), 跳过")
+                continue
+
             # 执行签到
-            result = sign_in(token)
-            if result is not None:
-                results.append(result)
+            status, message = sign_in(token)
+            if status == "ok" and message is not None:
+                results.append(message)
+
+            # 成功/已签到 -> 写入当日记忆, 今天再跑直接跳过; 失败不记, 下周期重试
+            if status in ("ok", "already"):
+                mark_done(state, today, key, status)
+                state_changed = True
 
             # 如果不是最后一个账号，则等待随机时间
             if i < len(tokens) - 1:
@@ -194,6 +257,9 @@ def main():
                 time.sleep(wait_time)
 
         group_results[send_key] = results
+
+    if state_changed:
+        save_state(state)
 
     # 推送通知 - 只在有获取到金豆时才发送
     print("\n📬 开始检查是否需要发送通知...")
