@@ -261,8 +261,11 @@ def main():
 
             # 如果不是最后一个账号，则等待随机时间
             if i < len(tokens) - 1:
-                wait_time = random.randint(5, 15)
-                print(f"⏳ 等待 {wait_time} 秒后处理下一个账号...")
+                # 随机间隔 (防风控: 固定节奏是机器特征); GHA 无人值守加大到 45~150s
+                import os as _os
+                lo, hi = (45, 150) if _os.environ.get('GITHUB_ACTIONS') == 'true' else (10, 30)
+                wait_time = round(random.uniform(lo, hi), 1)
+                print(f"⏳ 随机等待 {wait_time}s ({lo}~{hi}s) 后处理下一个账号...")
                 time.sleep(wait_time)
 
         group_results[send_key] = results
